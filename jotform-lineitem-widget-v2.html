@@ -1,0 +1,541 @@
+<!--
+  Enlighten — MCS Line Item Cost Sheet (JotForm Custom Widget) — v2.1
+  Single self-contained file. Paste into JotForm's inline "Custom Widget" element,
+  OR host it and add it as an iFrame widget (see MCS-SETUP.md).
+
+  v2.1 changes:
+    - CATEGORY is now REQUIRED on new entries (each active line must have a category).
+      Missing fields are highlighted in red on submit. (Not enforced on edit, so legacy
+      submissions without a category can still be reconciled.)
+  v2 changes:
+    - Per-line CATEGORY dropdown (item type). Locks on edit like the rest of the estimate.
+    - Includes the required JotForm Widget API <script> so submit + edit-reload work.
+    - Local-preview fallback: if opened directly (not inside JotForm) it runs DEMO mode.
+
+  Behavior:
+    - First submission: Description, Category, Quantity, Unit Price. Projected Cost = Qty x Unit
+      Price (auto, read-only). Final Purchase Cost column HIDDEN.
+    - On Edit: Description, Category, Quantity, Projected Cost lock to the original estimate. Unit
+      Price becomes the *actual* unit price; Final Purchase Cost column appears = Qty x actual.
+    - The whole grid serializes to ONE JSON value (one cell). Per-line-item explosion for reporting
+      is done downstream by the Google Apps Script ledger builder.
+
+  EDIT THE CATEGORY LIST: change the CATEGORIES array a few lines into the <script> below.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Line Item Cost Sheet</title>
+<!-- JotForm Custom Widget API (required for sendData / sendSubmit / edit reload) -->
+<script src="https://js.jotform.com/JotFormCustomWidget.min.js"></script>
+<style>
+  :root{
+    --ink:#1f2733;
+    --muted:#6b7585;
+    --line:#dfe3ea;
+    --line-strong:#c4cad6;
+    --bg:#ffffff;
+    --bg-soft:#f6f8fb;
+    --bg-lock:#f1f3f7;
+    --accent:#2f6fed;
+    --accent-soft:#e9f0ff;
+    --final:#0f8a5f;
+    --final-soft:#e7f6ef;
+    --danger:#b23b3b;
+    --danger-soft:#f6dcdc;
+    --radius:8px;
+    --fs:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);
+    font-size:var(--fs);
+    line-height:1.4;
+    background:transparent;
+  }
+  .wrap{padding:2px}
+
+  .demo-banner{
+    display:none;
+    align-items:center;
+    gap:10px;
+    background:#fff8e6;
+    border:1px solid #f0dca3;
+    color:#7a5a13;
+    border-radius:var(--radius);
+    padding:8px 10px;
+    margin-bottom:10px;
+    font-size:12.5px;
+  }
+  .demo-banner button{
+    margin-left:auto;
+    font-size:12.5px;
+    padding:5px 10px;
+    border:1px solid #d8bf73;
+    background:#fff;
+    color:#7a5a13;
+    border-radius:6px;
+    cursor:pointer;
+  }
+  .demo-banner button:hover{background:#fffaf0}
+
+  .mode-tag{
+    display:inline-block;
+    font-size:11px;
+    font-weight:600;
+    letter-spacing:.03em;
+    text-transform:uppercase;
+    padding:3px 8px;
+    border-radius:999px;
+    margin-bottom:8px;
+  }
+  .mode-tag.create{background:var(--accent-soft);color:var(--accent)}
+  .mode-tag.edit{background:var(--final-soft);color:var(--final)}
+
+  .table-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:var(--radius)}
+  table{border-collapse:collapse;width:100%;min-width:680px}
+  thead th{
+    background:var(--bg-soft);
+    text-align:left;
+    font-size:12px;
+    font-weight:600;
+    color:var(--muted);
+    padding:9px 10px;
+    border-bottom:1px solid var(--line);
+    white-space:nowrap;
+  }
+  th.num,td.num{text-align:right}
+  th.center,td.center{text-align:center}
+  th .req{color:var(--danger);font-weight:700}
+  tbody td{
+    padding:6px 8px;
+    border-bottom:1px solid var(--line);
+    vertical-align:middle;
+  }
+  tbody tr:last-child td{border-bottom:none}
+
+  input.cell,select.cell{
+    width:100%;
+    border:1px solid var(--line);
+    border-radius:6px;
+    padding:7px 8px;
+    font:inherit;
+    color:var(--ink);
+    background:var(--bg);
+    outline:none;
+  }
+  input.cell:focus,select.cell:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  input.cell.num{text-align:right}
+  input.cell[readonly],input.cell.locked,
+  select.cell:disabled,select.cell.locked{
+    background:var(--bg-lock);
+    color:var(--muted);
+    border-color:transparent;
+    cursor:default;
+    -webkit-appearance:none;appearance:none;
+  }
+  input.cell.actual{border-color:var(--final);background:#fff}
+  input.cell.actual:focus{box-shadow:0 0 0 3px var(--final-soft)}
+  input.cell.invalid,select.cell.invalid{
+    border-color:var(--danger);
+    box-shadow:0 0 0 3px var(--danger-soft);
+  }
+
+  .calc{
+    display:inline-block;
+    font-variant-numeric:tabular-nums;
+    padding:7px 6px;
+    color:var(--ink);
+    white-space:nowrap;
+  }
+  .calc.final{color:var(--final);font-weight:600}
+  .calc.empty{color:#aab2c0}
+
+  .col-final{display:none}
+  body.is-edit .col-final{display:table-cell}
+
+  .del{
+    border:none;background:transparent;color:var(--muted);
+    font-size:18px;line-height:1;cursor:pointer;padding:4px 6px;border-radius:6px;
+  }
+  .del:hover{background:#fbeaea;color:var(--danger)}
+
+  tfoot td{
+    padding:10px;
+    border-top:2px solid var(--line-strong);
+    background:var(--bg-soft);
+    font-weight:600;
+    font-variant-numeric:tabular-nums;
+  }
+  tfoot .label{color:var(--muted);font-weight:600}
+
+  .actions{margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .btn{
+    font:inherit;font-weight:600;
+    border:1px solid var(--accent);
+    background:var(--accent);color:#fff;
+    padding:8px 14px;border-radius:7px;cursor:pointer;
+  }
+  .btn:hover{filter:brightness(.96)}
+  .btn.ghost{background:#fff;color:var(--accent)}
+  .btn.ghost:hover{background:var(--accent-soft)}
+  .hint{font-size:12px;color:var(--muted)}
+  .err{font-size:12px;color:var(--danger);font-weight:600}
+
+  .empty-row td{color:var(--muted);text-align:center;padding:18px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="demo-banner" id="demoBanner">
+    <span><strong>Preview mode</strong> — not running inside JotForm. Use this button to simulate the edit reload.</span>
+    <button type="button" id="demoToggle">Simulate Edit submission</button>
+  </div>
+
+  <span class="mode-tag create" id="modeTag">New entry</span>
+
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th style="min-width:160px">Description <span class="req">*</span></th>
+          <th style="min-width:150px">Category <span class="req">*</span></th>
+          <th class="num" style="width:90px">Quantity <span class="req">*</span></th>
+          <th class="num" style="width:120px">Unit Price</th>
+          <th class="num" style="width:130px">Projected Cost</th>
+          <th class="num col-final" style="width:150px">Final Purchase Cost</th>
+          <th class="center" style="width:40px"></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+      <tfoot>
+        <tr>
+          <td class="label" colspan="4">Totals</td>
+          <td class="num" id="totProjected">$0.00</td>
+          <td class="num col-final" id="totFinal">$0.00</td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <div class="actions">
+    <button type="button" class="btn ghost" id="addRow">+ Add line</button>
+    <span class="hint" id="editHint" style="display:none">Estimate is locked. Enter the actual unit price; Final Purchase Cost recalculates.</span>
+    <span class="err" id="errMsg" style="display:none">Every line needs a Description, Category, and Quantity greater than 0.</span>
+  </div>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ====== EDIT ME: per-line item categories (item types) shown in the dropdown ======
+  var CATEGORIES = [
+    "Classroom Materials",
+    "Office/Admin Supplies",
+    "Technology",
+    "Furniture & Equipment",
+    "Books & Curriculum",
+    "Art Supplies",
+    "Science & Garden",
+    "Food & Snacks",
+    "Health & Safety",
+    "Other"
+  ];
+  // =================================================================================
+
+  var HAS_JF = !!(window.JFCustomWidget);
+  var isEdit = false;          // true once we detect a prior submission
+  var showErrors = false;      // flip on after a failed submit to highlight missing fields
+  var rows = [];               // [{id, d, c, q, u, pc, fc}]
+  var fmt = new Intl.NumberFormat(undefined, {style:"currency", currency:"USD"});
+
+  var $rows = document.getElementById("rows");
+  var $addRow = document.getElementById("addRow");
+  var $totProjected = document.getElementById("totProjected");
+  var $totFinal = document.getElementById("totFinal");
+  var $modeTag = document.getElementById("modeTag");
+  var $editHint = document.getElementById("editHint");
+  var $errMsg = document.getElementById("errMsg");
+
+  function n(v){ var x = parseFloat(v); return isFinite(x) ? x : 0; }
+  function uid(){ return "li_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+  function blankRow(){ return { id: uid(), d:"", c:"", q:"", u:"", pc:null, fc:null }; }
+
+  // ---------- validation ----------
+  function activeRow(r){ return (r.d||"").trim() !== "" || n(r.q) > 0 || (r.c||"") !== ""; }
+  function rowComplete(r){
+    if ((r.d||"").trim() === "") return false;
+    if (!(n(r.q) > 0)) return false;
+    if (!isEdit && (r.c||"") === "") return false;   // category required on new entries only
+    return true;
+  }
+  function validForSubmit(){
+    var anyActive = false, ok = true;
+    rows.forEach(function(r){ if (activeRow(r)){ anyActive = true; if (!rowComplete(r)) ok = false; } });
+    return anyActive && ok;
+  }
+
+  // ---------- render ----------
+  function render(){
+    document.body.classList.toggle("is-edit", isEdit);
+    $modeTag.className = "mode-tag " + (isEdit ? "edit" : "create");
+    $modeTag.textContent = isEdit ? "Editing — enter actuals" : "New entry";
+    $editHint.style.display = isEdit ? "" : "none";
+
+    $rows.innerHTML = "";
+
+    if (!rows.length){
+      var er = document.createElement("tr");
+      er.className = "empty-row";
+      er.innerHTML = '<td colspan="7">No line items yet. Click “Add line” to start.</td>';
+      $rows.appendChild(er);
+    }
+
+    rows.forEach(function(r, i){
+      var qty = n(r.q), unit = n(r.u);
+      var projected = isEdit ? n(r.pc) : qty * unit;     // locked snapshot on edit, live otherwise
+      var finalCost = qty * unit;                         // on edit, unit == actual unit price
+      var act = showErrors && activeRow(r);
+      var descBad = act && (r.d||"").trim() === "";
+      var qtyBad  = act && !(qty > 0);
+      var catBad  = act && !isEdit && (r.c||"") === "";
+
+      var tr = document.createElement("tr");
+
+      // Description
+      var tdD = document.createElement("td");
+      tdD.appendChild(textInput(r.d, isEdit, function(v){ r.d = v; refreshErr(); }, "Item description", descBad));
+      tr.appendChild(tdD);
+
+      // Category (item type) — required on new entries, locked on edit
+      var tdC = document.createElement("td");
+      tdC.appendChild(selectInput(r.c, isEdit, function(v){ r.c = v; refreshErr(); }, catBad));
+      tr.appendChild(tdC);
+
+      // Quantity
+      var tdQ = document.createElement("td");
+      tdQ.className = "num";
+      tdQ.appendChild(numInput(r.q, isEdit, function(v){ r.q = v; recalcAndPush(); refreshErr(); }, "0", qtyBad));
+      tr.appendChild(tdQ);
+
+      // Unit Price (editable in both modes; on edit it represents the ACTUAL unit price)
+      var tdU = document.createElement("td");
+      tdU.className = "num";
+      var unitInput = numInput(r.u, false, function(v){ r.u = v; recalcAndPush(); }, "0.00", false);
+      if (isEdit) unitInput.classList.add("actual");
+      tdU.appendChild(unitInput);
+      tr.appendChild(tdU);
+
+      // Projected Cost (calculated; locked on edit)
+      var tdP = document.createElement("td");
+      tdP.className = "num";
+      tdP.appendChild(calcCell(projected, false, (qty===0 && unit===0 && !isEdit)));
+      tr.appendChild(tdP);
+
+      // Final Purchase Cost (hidden until edit)
+      var tdF = document.createElement("td");
+      tdF.className = "num col-final";
+      var hasFinal = qty > 0 && unit > 0;
+      tdF.appendChild(calcCell(finalCost, true, !hasFinal));
+      tr.appendChild(tdF);
+
+      // Delete
+      var tdX = document.createElement("td");
+      tdX.className = "center";
+      var del = document.createElement("button");
+      del.type = "button"; del.className = "del"; del.title = "Remove line"; del.textContent = "×";
+      del.addEventListener("click", function(){ rows.splice(i,1); render(); recalcAndPush(); });
+      if (isEdit) { del.disabled = true; del.style.visibility = "hidden"; } // keep line set stable on edit
+      tdX.appendChild(del);
+      tr.appendChild(tdX);
+
+      $rows.appendChild(tr);
+    });
+
+    recalcTotals();
+    refreshErr();
+    resize();
+  }
+
+  function refreshErr(){
+    if ($errMsg) $errMsg.style.display = (showErrors && !validForSubmit()) ? "" : "none";
+  }
+
+  function textInput(val, locked, onInput, ph, invalid){
+    var el = document.createElement("input");
+    el.type = "text"; el.className = "cell" + (invalid ? " invalid" : "");
+    el.value = val || ""; el.placeholder = ph || "";
+    if (locked){ el.readOnly = true; }
+    el.addEventListener("input", function(){ el.classList.remove("invalid"); onInput(el.value); });
+    return el;
+  }
+  function numInput(val, locked, onInput, ph, invalid){
+    var el = document.createElement("input");
+    el.type = "number"; el.className = "cell num" + (invalid ? " invalid" : "");
+    el.value = (val===0?0:(val||"")); el.placeholder = ph || "";
+    el.min = "0"; el.step = "any"; el.inputMode = "decimal";
+    if (locked){ el.readOnly = true; }
+    el.addEventListener("input", function(){ el.classList.remove("invalid"); onInput(el.value); });
+    return el;
+  }
+  function selectInput(val, locked, onChange, invalid){
+    var el = document.createElement("select");
+    el.className = "cell" + (invalid ? " invalid" : "");
+    var opt0 = document.createElement("option");
+    opt0.value = ""; opt0.textContent = "— Select —";
+    el.appendChild(opt0);
+    CATEGORIES.forEach(function(c){
+      var o = document.createElement("option");
+      o.value = c; o.textContent = c;
+      el.appendChild(o);
+    });
+    // If a stored category is no longer in the list, keep it so data isn't lost.
+    if (val && CATEGORIES.indexOf(val) === -1){
+      var ox = document.createElement("option");
+      ox.value = val; ox.textContent = val;
+      el.appendChild(ox);
+    }
+    el.value = val || "";
+    if (locked){ el.disabled = true; el.classList.add("locked"); }
+    el.addEventListener("change", function(){ el.classList.remove("invalid"); onChange(el.value); });
+    return el;
+  }
+  function calcCell(amount, isFinal, isEmpty){
+    var span = document.createElement("span");
+    span.className = "calc" + (isFinal ? " final" : "") + (isEmpty ? " empty" : "");
+    span.textContent = isEmpty ? "—" : fmt.format(amount);
+    return span;
+  }
+
+  function recalcTotals(){
+    var tp = 0, tf = 0;
+    rows.forEach(function(r){
+      var qty = n(r.q), unit = n(r.u);
+      tp += isEdit ? n(r.pc) : qty * unit;
+      tf += qty * unit;
+    });
+    $totProjected.textContent = fmt.format(tp);
+    $totFinal.textContent = fmt.format(tf);
+  }
+
+  // ---------- serialize / push ----------
+  function snapshot(){
+    return rows.map(function(r){
+      var qty = n(r.q), unit = n(r.u);
+      var pc = isEdit ? n(r.pc) : qty * unit;
+      var fc = isEdit ? qty * unit : null;   // final only exists once we're in edit
+      return { id: r.id, d:(r.d||""), c:(r.c||""), q:r.q, u:r.u, pc:round2(pc), fc:(fc===null?null:round2(fc)) };
+    });
+  }
+  function round2(x){ return Math.round(n(x)*100)/100; }
+  function serialize(){ return JSON.stringify({ v:2, mode:(isEdit?"final":"projected"), items:snapshot() }); }
+
+  function recalcAndPush(){
+    recalcTotals();
+    pushToForm();
+  }
+  function pushToForm(){
+    if (!HAS_JF) return;
+    try { JFCustomWidget.sendData({ value: serialize() }); } catch(e){}
+  }
+
+  function resize(){
+    if (!HAS_JF) return;
+    try {
+      var h = document.body.scrollHeight + 8;
+      JFCustomWidget.requestFrameResize({ height: h });
+    } catch(e){}
+  }
+
+  // ---------- load existing value ----------
+  function loadValue(raw){
+    if (!raw){ rows = [ blankRow() ]; isEdit = false; return; }
+    var parsed = null;
+    try { parsed = JSON.parse(raw); } catch(e){ parsed = null; }
+    if (!parsed || !parsed.items || !parsed.items.length){ rows = [ blankRow() ]; isEdit = false; return; }
+
+    rows = parsed.items.map(function(it){
+      return { id: it.id || uid(), d: it.d||"", c: it.c||"", q: it.q, u: it.u,
+               pc: (it.pc!=null?it.pc:null), fc: (it.fc!=null?it.fc:null) };
+    });
+    // We're editing if there's a prior submission with projected costs recorded.
+    isEdit = rows.some(function(r){ return r.pc != null; });
+  }
+
+  // ---------- wiring ----------
+  $addRow.addEventListener("click", function(){
+    if (isEdit) return; // lines are fixed once submitted
+    rows.push(blankRow());
+    render();
+    recalcAndPush();
+  });
+
+  // ---------- standalone DEMO (runs when not embedded in JotForm) ----------
+  function startDemo(){
+    HAS_JF = false;
+    var banner = document.getElementById("demoBanner");
+    if (banner) banner.style.display = "flex";
+    var prior = null;
+    var toggle = document.getElementById("demoToggle");
+    if (toggle){
+      toggle.addEventListener("click", function(){
+        if (!isEdit){
+          prior = serialize();         // capture "first submission"
+          loadValue(prior);            // reload as if re-opened for edit
+          this.textContent = "Back to New entry";
+        } else {
+          loadValue(null);             // fresh form
+          rows = [ blankRow() ];
+          isEdit = false;
+          this.textContent = "Simulate Edit submission";
+        }
+        showErrors = false;
+        render();
+      });
+    }
+    if (!rows.length) rows = [ blankRow() ];
+    render();
+  }
+
+  // ---------- init ----------
+  var readyFired = false;
+  if (HAS_JF){
+    JFCustomWidget.subscribe("ready", function(data){
+      readyFired = true;
+      var banner = document.getElementById("demoBanner");
+      if (banner) banner.style.display = "none";   // ensure no demo UI inside JotForm
+      var incoming = "";
+      if (data && typeof data.value !== "undefined" && data.value !== null) incoming = data.value;
+      if (!incoming){
+        try { var s = JFCustomWidget.getWidgetSetting("defaultValue"); if (s) incoming = s; } catch(e){}
+      }
+      loadValue(incoming);
+      render();
+      pushToForm(); // ensure the value persists even if the user changes nothing
+    });
+
+    JFCustomWidget.subscribe("submit", function(){
+      showErrors = true;
+      render();
+      var val = serialize();
+      JFCustomWidget.sendSubmit({ valid: validForSubmit(), value: val });
+    });
+
+    // Local-preview fallback: API script loaded but we're not actually embedded in a JotForm
+    // parent (no "ready" arrives). After a short wait, fall back to DEMO mode.
+    setTimeout(function(){ if (!readyFired){ startDemo(); } }, 1500);
+  } else {
+    startDemo();
+  }
+})();
+</script>
+</body>
+</html>
